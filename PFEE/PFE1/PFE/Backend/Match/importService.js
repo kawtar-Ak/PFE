@@ -1,219 +1,362 @@
-// Backend/Match/importService.js
-
-// ✅ fetch compatible Node < 18
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 const Match = require("./MatchModel");
 
-// API football-data.org
-const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
-const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY;
+const API_SPORTS_BASE_URL = "https://v3.football.api-sports.io";
+const API_SPORTS_KEY = process.env.APISPORTS_KEY;
+const IMPORT_TIMEZONE = process.env.MATCH_TIMEZONE || "Europe/Paris";
+const IMPORT_PAST_DAYS = Number(process.env.MATCH_IMPORT_PAST_DAYS || 1);
+const IMPORT_FUTURE_DAYS = Number(process.env.MATCH_IMPORT_FUTURE_DAYS || 3);
 
-// Ligues supportées
 const LEAGUES = {
-  PL: "Premier League",
-  PD: "La Liga",
-  SA: "Serie A",
-  BL1: "Bundesliga",
-  FL1: "Ligue 1",
-  PPL: "Primeira Liga",
-  DED: "Eredivisie",
-  CL: "Champions League",
-  EL: "Europa League",
+  PL: { id: 39, name: "Premier League" },
+  PD: { id: 140, name: "La Liga" },
+  SA: { id: 135, name: "Serie A" },
+  BL1: { id: 78, name: "Bundesliga" },
+  FL1: { id: 61, name: "Ligue 1" },
+  PPL: { id: 94, name: "Primeira Liga" },
+  DED: { id: 88, name: "Eredivisie" },
+  CL: { id: 2, name: "Champions League" },
+  EL: { id: 3, name: "Europa League" }
 };
 
-// ✅ Statuts officiels football-data v4
-const STATUS_QUERY = [
-  "SCHEDULED",
-  "TIMED",
-  "IN_PLAY",
-  "PAUSED",
-  "EXTRA_TIME",
-  "PENALTY_SHOOTOUT",
-  "FINISHED",
-].join(",");
+const LIVE_STATUS = new Set(["1H", "HT", "2H", "ET", "BT", "P", "LIVE", "INT"]);
+const FINISHED_STATUS = new Set(["FT", "AET", "PEN"]);
 
-const statusMap = {
-  SCHEDULED: "scheduled",
-  TIMED: "scheduled",
-  IN_PLAY: "live",
-  PAUSED: "live",
-  EXTRA_TIME: "live",
-  PENALTY_SHOOTOUT: "live",
-  FINISHED: "finished",
+let importAllInProgress = false;
+let livePollInProgress = false;
+let scheduledPollInProgress = false;
+
+const getHeaders = () => ({
+  "x-apisports-key": API_SPORTS_KEY
+});
+
+const getCurrentSeason = () => {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth() + 1;
+  return month >= 7 ? year : year - 1;
 };
 
-const fetchLeagueMatches = async (leagueCode) => {
-  try {
-    if (!FOOTBALL_DATA_KEY) {
-      console.warn("⚠️ FOOTBALL_DATA_KEY not configured.");
-      return [];
+const formatDate = (date) => date.toISOString().slice(0, 10);
+
+const getDateWindow = () => {
+  const now = new Date();
+  const from = new Date(now);
+  from.setUTCDate(from.getUTCDate() - IMPORT_PAST_DAYS);
+
+  const to = new Date(now);
+  to.setUTCDate(to.getUTCDate() + IMPORT_FUTURE_DAYS);
+
+  return {
+    from: formatDate(from),
+    to: formatDate(to)
+  };
+};
+
+const mapStatus = (shortStatus = "") => {
+  if (LIVE_STATUS.has(shortStatus)) return "live";
+  if (FINISHED_STATUS.has(shortStatus)) return "finished";
+  return "scheduled";
+};
+
+const requestFixtures = async (params) => {
+  if (!API_SPORTS_KEY) {
+    console.warn("API_SPORTS_KEY not configured.");
+    return [];
+  }
+
+  const url = new URL(`${API_SPORTS_BASE_URL}/fixtures`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
     }
+  });
 
-    const url = `${FOOTBALL_DATA_API}/competitions/${leagueCode}/matches?status=${STATUS_QUERY}`;
-    const response = await fetch(url, {
-      headers: { "X-Auth-Token": FOOTBALL_DATA_KEY },
-    });
+  try {
+    const response = await fetch(url, { headers: getHeaders() });
 
     if (!response.ok) {
-      const txt = await response.text().catch(() => "");
-      console.error(
-        `❌ API error ${response.status}: ${response.statusText} ${txt}`
-      );
+      const body = await response.text().catch(() => "");
+      console.error(`API-Sports error ${response.status}: ${response.statusText} ${body}`);
       return [];
     }
 
-    const data = await response.json();
-    return data?.matches || [];
+    const payload = await response.json();
+
+    if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
+      console.error("API-Sports payload errors:", payload.errors);
+      return [];
+    }
+
+    return Array.isArray(payload?.response) ? payload.response : [];
   } catch (error) {
-    console.error(`❌ Error fetching matches for ${leagueCode}:`, error.message);
+    console.error("API-Sports request failed:", error.message);
     return [];
   }
 };
 
-const pickScore = (match) => {
-  const ft = match?.score?.fullTime || {};
-  const ht = match?.score?.halfTime || {};
+const fetchLeagueFixtures = async (leagueCode) => {
+  const league = LEAGUES[leagueCode];
+  if (!league) return [];
 
-  const home = ft.home ?? ht.home ?? null;
-  const away = ft.away ?? ht.away ?? null;
+  const season = getCurrentSeason();
+  const { from, to } = getDateWindow();
 
-  return { home, away };
+  return requestFixtures({
+    league: league.id,
+    season,
+    from,
+    to,
+    timezone: IMPORT_TIMEZONE
+  });
 };
 
-const transformMatch = (match, leagueName) => {
-  const { home, away } = pickScore(match);
+const fetchLiveFixtures = async () => requestFixtures({
+  live: "all",
+  timezone: IMPORT_TIMEZONE
+});
 
-  return {
-    apiMatchId: match.id, // ✅ id stable
-    homeTeam: match?.homeTeam?.name || "Unknown",
-    awayTeam: match?.awayTeam?.name || "Unknown",
-    homeScore: home,
-    awayScore: away,
-    date: new Date(match.utcDate),
-    league: leagueName,
-    status: statusMap[match.status] || "scheduled",
-    updatedAt: new Date(),
-  };
+const transformFixture = (fixture, fallbackLeagueCode = null, fallbackLeagueName = null) => ({
+  apiMatchId: fixture?.fixture?.id,
+  homeTeam: fixture?.teams?.home?.name || "Unknown",
+  awayTeam: fixture?.teams?.away?.name || "Unknown",
+  homeScore: fixture?.goals?.home ?? null,
+  awayScore: fixture?.goals?.away ?? null,
+  date: fixture?.fixture?.date ? new Date(fixture.fixture.date) : null,
+  league: fixture?.league?.name || fallbackLeagueName || "Unknown League",
+  leagueCode: fallbackLeagueCode,
+  status: mapStatus(fixture?.fixture?.status?.short),
+  updatedAt: new Date()
+});
+
+const isMeaningfulChange = (existing, nextMatch) => {
+  if (!existing) return true;
+
+  return (
+    existing.homeScore !== nextMatch.homeScore ||
+    existing.awayScore !== nextMatch.awayScore ||
+    existing.status !== nextMatch.status ||
+    String(existing.date) !== String(nextMatch.date) ||
+    existing.homeTeam !== nextMatch.homeTeam ||
+    existing.awayTeam !== nextMatch.awayTeam ||
+    existing.league !== nextMatch.league
+  );
 };
 
-// ✅ UPSERT: update si existe, insert sinon
-const upsertMatches = async (list) => {
-  let count = 0;
+const upsertMatch = async (match) => {
+  return Match.findOneAndUpdate(
+    { apiMatchId: match.apiMatchId },
+    { $set: match },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+      lean: true
+    }
+  );
+};
 
-  for (const item of list) {
-    if (!item?.apiMatchId) continue;
+const mergeFixtures = (fixtures, leagueCode, leagueName, bucket) => {
+  fixtures.forEach((fixture) => {
+    const transformed = transformFixture(fixture, leagueCode, leagueName);
+    if (!transformed.apiMatchId || !transformed.date) return;
 
-    await Match.updateOne(
-      { apiMatchId: item.apiMatchId },
-      { $set: item },
-      { upsert: true }
-    );
+    const existing = bucket.get(transformed.apiMatchId);
+    if (!existing || transformed.status === "live" || existing.status !== "live") {
+      bucket.set(transformed.apiMatchId, transformed);
+    }
+  });
+};
 
-    count += 1;
+const syncMatches = async (matches, io, emitUpdates = false) => {
+  let upserted = 0;
+  let emitted = 0;
+
+  for (const match of matches) {
+    if (!match?.apiMatchId || !match?.date) continue;
+
+    const existing = await Match.findOne({ apiMatchId: match.apiMatchId }).lean();
+    const changed = isMeaningfulChange(existing, match);
+
+    if (!changed) {
+      continue;
+    }
+
+    const saved = await upsertMatch(match);
+    upserted += 1;
+
+    if (emitUpdates && io) {
+      io.emit("match:update", saved);
+      emitted += 1;
+    }
   }
 
-  return count;
+  return { upserted, emitted };
 };
 
-// Importer une seule ligue
-const importLeagueMatches = async (leagueCode) => {
+const importLeagueMatches = async (leagueCode, io = null) => {
   try {
-    const leagueName = LEAGUES[leagueCode];
-    if (!leagueName) {
+    const league = LEAGUES[leagueCode];
+    if (!league) {
       return { success: false, message: "League not found", count: 0 };
     }
 
-    if (!FOOTBALL_DATA_KEY) {
-      return { success: false, message: "API key not configured", count: 0 };
+    if (!API_SPORTS_KEY) {
+      return { success: false, message: "API_SPORTS_KEY not configured", count: 0 };
     }
 
-    console.log(`📥 Refresh ${leagueName}...`);
-    const matches = await fetchLeagueMatches(leagueCode);
+    const fixtures = await fetchLeagueFixtures(leagueCode);
+    const liveFixtures = await fetchLiveFixtures();
+    const relevantLiveFixtures = liveFixtures.filter((fixture) => fixture?.league?.id === league.id);
+    const bucket = new Map();
 
-    const transformed = matches
-      .filter(
-        (m) => m?.id && m?.homeTeam?.name && m?.awayTeam?.name && m?.utcDate
-      )
-      .map((m) => transformMatch(m, leagueName));
+    mergeFixtures(fixtures, leagueCode, league.name, bucket);
+    mergeFixtures(relevantLiveFixtures, leagueCode, league.name, bucket);
 
-    if (transformed.length === 0) {
-      return {
-        success: true,
-        message: `No matches for ${leagueName}`,
-        count: 0,
-        league: leagueName,
-      };
-    }
-
-    const upserted = await upsertMatches(transformed);
+    const { upserted, emitted } = await syncMatches([...bucket.values()], io, Boolean(io));
 
     return {
       success: true,
-      message: `Upserted ${upserted} matches for ${leagueName}`,
+      message: `Upserted ${upserted} matches for ${league.name}`,
       count: upserted,
-      league: leagueName,
+      emitted,
+      league: league.name
     };
   } catch (error) {
-    console.error("❌ importLeagueMatches error:", error);
+    console.error("importLeagueMatches error:", error);
     return { success: false, message: error.message, count: 0 };
   }
 };
 
-// Importer toutes les ligues
-const importAllMatches = async () => {
-  try {
-    console.log("🔄 Refreshing matches from football-data.org...");
+const importAllMatches = async (io = null) => {
+  if (importAllInProgress) {
+    return {
+      success: true,
+      message: "Import already running",
+      count: 0
+    };
+  }
 
-    if (!FOOTBALL_DATA_KEY) {
+  try {
+    if (!API_SPORTS_KEY) {
       return {
         success: false,
-        message: "FOOTBALL_DATA_KEY not configured",
-        count: 0,
+        message: "API_SPORTS_KEY not configured",
+        count: 0
       };
     }
 
+    importAllInProgress = true;
+    const liveFixtures = await fetchLiveFixtures();
     let total = 0;
+    let totalEmitted = 0;
 
-    for (const [code, name] of Object.entries(LEAGUES)) {
-      console.log(`📥 Refresh ${name}...`);
-      const matches = await fetchLeagueMatches(code);
+    for (const [leagueCode, league] of Object.entries(LEAGUES)) {
+      const fixtures = await fetchLeagueFixtures(leagueCode);
+      const relevantLiveFixtures = liveFixtures.filter((fixture) => fixture?.league?.id === league.id);
+      const bucket = new Map();
 
-      const transformed = matches
-        .filter(
-          (m) => m?.id && m?.homeTeam?.name && m?.awayTeam?.name && m?.utcDate
-        )
-        .map((m) => transformMatch(m, name));
+      mergeFixtures(fixtures, leagueCode, league.name, bucket);
+      mergeFixtures(relevantLiveFixtures, leagueCode, league.name, bucket);
 
-      const upserted = await upsertMatches(transformed);
+      const { upserted, emitted } = await syncMatches([...bucket.values()], io, Boolean(io));
       total += upserted;
+      totalEmitted += emitted;
 
-      console.log(`✅ ${name}: upserted ${upserted}`);
+      console.log(`[scheduled-import] ${league.name}: upserted ${upserted}, emitted ${emitted}`);
     }
 
     return {
       success: true,
-      message: `Upserted ${total} matches`,
+      message: `Upserted ${total} matches from API-Sports`,
       count: total,
+      emitted: totalEmitted
     };
   } catch (error) {
-    console.error("❌ importAllMatches error:", error);
+    console.error("importAllMatches error:", error);
+    return {
+      success: false,
+      message: error.message,
+      count: 0
+    };
+  } finally {
+    importAllInProgress = false;
+  }
+};
+
+const pollLiveMatchesAndEmitUpdates = async (io) => {
+  if (livePollInProgress) {
+    return { success: true, message: "Live polling already running", count: 0, emitted: 0 };
+  }
+
+  try {
+    if (!API_SPORTS_KEY) {
+      return { success: false, message: "API_SPORTS_KEY not configured", count: 0, emitted: 0 };
+    }
+
+    livePollInProgress = true;
+    const liveFixtures = await fetchLiveFixtures();
+    const transformedMatches = liveFixtures
+      .map((fixture) => {
+        const matchingLeague = Object.entries(LEAGUES).find(([, league]) => league.id === fixture?.league?.id);
+        return transformFixture(
+          fixture,
+          matchingLeague?.[0] || null,
+          matchingLeague?.[1]?.name || fixture?.league?.name || null
+        );
+      })
+      .filter((match) => match.apiMatchId && match.date);
+
+    const { upserted, emitted } = await syncMatches(transformedMatches, io, true);
+    console.log(`[live-poll] checked ${transformedMatches.length}, upserted ${upserted}, emitted ${emitted}`);
+
+    return {
+      success: true,
+      message: "Live matches polled",
+      count: upserted,
+      emitted
+    };
+  } catch (error) {
+    console.error("pollLiveMatchesAndEmitUpdates error:", error);
     return {
       success: false,
       message: error.message,
       count: 0,
+      emitted: 0
     };
+  } finally {
+    livePollInProgress = false;
   }
 };
 
-const getSupportedLeagues = () => {
-  return Object.entries(LEAGUES).map(([code, name]) => ({ code, name }));
+const pollScheduledMatches = async (io) => {
+  if (scheduledPollInProgress) {
+    return { success: true, message: "Scheduled polling already running", count: 0, emitted: 0 };
+  }
+
+  try {
+    scheduledPollInProgress = true;
+    const result = await importAllMatches(io);
+    console.log(`[scheduled-poll] upserted ${result.count || 0}, emitted ${result.emitted || 0}`);
+    return result;
+  } finally {
+    scheduledPollInProgress = false;
+  }
 };
+
+const getSupportedLeagues = () => Object.entries(LEAGUES).map(([code, league]) => ({
+  code,
+  id: league.id,
+  name: league.name
+}));
 
 module.exports = {
   importAllMatches,
   importLeagueMatches,
+  pollLiveMatchesAndEmitUpdates,
+  pollScheduledMatches,
   getSupportedLeagues,
-  LEAGUES,
+  LEAGUES
 };

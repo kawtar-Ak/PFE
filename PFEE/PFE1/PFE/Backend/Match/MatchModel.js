@@ -1,6 +1,12 @@
 const mongoose = require("mongoose");
 
 const MatchSchema = new mongoose.Schema({
+  apiMatchId: {
+    type: Number,
+    required: true,
+    unique: true,
+    index: true
+  },
   homeTeam: {
     type: mongoose.Schema.Types.Mixed,
     required: true
@@ -24,6 +30,10 @@ const MatchSchema = new mongoose.Schema({
   league: {
     type: String,
     required: true
+  },
+  leagueCode: {
+    type: String,
+    default: null
   },
   status: {
     type: String,

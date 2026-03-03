@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Keyboard,
@@ -35,6 +35,7 @@ export default function HomeScreen({ navigation }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [isLogged, setIsLogged] = useState(false);
   const [favoriteIds, setFavoriteIds] = useState(new Set());
+  const socketRef = useRef(null);
 
   useEffect(() => {
     generateDateRange();
@@ -53,6 +54,51 @@ export default function HomeScreen({ navigation }) {
       unsubscribeFavorites?.();
     };
   }, [navigation]);
+
+  useEffect(() => {
+    const socket = matchService.createSocketConnection();
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('[socket] connected', socket.id);
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('[socket] connect_error', error?.message || error);
+    });
+
+    socket.on('reconnect', (attempt) => {
+      console.log('[socket] reconnected after', attempt, 'attempt(s)');
+    });
+
+    socket.on('match:update', (updatedMatch) => {
+      setMatches((previousMatches) => {
+        const nextMatches = matchService.mergeMatchIntoList(previousMatches, updatedMatch);
+
+        setExpandedLeagues((previous) => {
+          if (!updatedMatch?.league || previous[updatedMatch.league] !== undefined) {
+            return previous;
+          }
+
+          return {
+            ...previous,
+            [updatedMatch.league]: true,
+          };
+        });
+
+        return nextMatches;
+      });
+    });
+
+    return () => {
+      socket.off('connect');
+      socket.off('connect_error');
+      socket.off('reconnect');
+      socket.off('match:update');
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, []);
 
   const hydrateScreen = async () => {
     await Promise.all([loadMatches(), refreshAuthAndFavorites()]);

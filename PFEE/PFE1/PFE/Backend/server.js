@@ -1,17 +1,27 @@
 require("dotenv").config();
 const express = require("express");
+const http = require("http");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const userRoutes = require("./User/UserRoute.js");
 const matchRoutes = require("./Match/MatchRoute.js");
-const { importAllMatches } = require("./Match/importService.js");
+const {
+  importAllMatches,
+  pollLiveMatchesAndEmitUpdates,
+  pollScheduledMatches
+} = require("./Match/importService.js");
+const { initSocket } = require("./socket.js");
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/PFE";
+const LIVE_POLL_INTERVAL_MS = Number(process.env.LIVE_POLL_INTERVAL_MS || 15000);
+const SCHEDULED_POLL_INTERVAL_MS = Number(process.env.SCHEDULED_POLL_INTERVAL_MS || 90000);
 
-// Middleware
+const io = initSocket(server);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({
@@ -35,40 +45,49 @@ const globalLimiter = rateLimit({
 
 app.use(globalLimiter);
 
-// MongoDB Connection
 mongoose
   .connect(MONGO_URI)
   .then(() => {
-    console.log("✅ MongoDB connected to", MONGO_URI);
-    // Import matches automatically on server start
-    console.log("🔄 Importing matches from football-data.org...");
-    importAllMatches();
+    console.log("MongoDB connected to", MONGO_URI);
+    console.log("Importing matches from API-Sports...");
+
+    importAllMatches(io).catch((error) => {
+      console.error("Initial match import failed:", error);
+    });
+
+    setInterval(() => {
+      pollLiveMatchesAndEmitUpdates(io).catch((error) => {
+        console.error("Live polling failed:", error);
+      });
+    }, LIVE_POLL_INTERVAL_MS);
+
+    setInterval(() => {
+      pollScheduledMatches(io).catch((error) => {
+        console.error("Scheduled polling failed:", error);
+      });
+    }, SCHEDULED_POLL_INTERVAL_MS);
   })
-  .catch(err => {
-    console.error("❌ MongoDB connection error:", err);
+  .catch((err) => {
+    console.error("MongoDB connection error:", err);
     process.exit(1);
   });
 
-// Routes
 app.use("/api/user", userRoutes);
 app.use("/api/match", matchRoutes);
 
-// Health check endpoint
 app.get("/", (req, res) => {
   res.json({ status: "Server is running" });
 });
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
 });
 
-// Error handler middleware
 app.use((err, req, res, next) => {
   console.error("Error:", err);
   res.status(500).json({ error: "Internal server error", message: err.message });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });

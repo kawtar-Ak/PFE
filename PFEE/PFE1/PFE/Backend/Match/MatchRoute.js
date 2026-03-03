@@ -4,6 +4,7 @@ const Match = require("../Match/MatchModel");
 const {
   importAllMatches,
   importLeagueMatches,
+  pollLiveMatchesAndEmitUpdates,
   getSupportedLeagues
 } = require("../Match/importService");
 
@@ -11,6 +12,16 @@ const {
 router.get("/", async (req, res) => {
   try {
     const matches = await Match.find().sort({ date: 1 });
+    res.status(200).json({ matches });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET live matches only
+router.get("/live", async (req, res) => {
+  try {
+    const matches = await Match.find({ status: "live" }).sort({ date: 1 });
     res.status(200).json({ matches });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -42,6 +53,16 @@ router.post("/import/all", async (req, res) => {
   try {
     const result = await importAllMatches();
     res.status(200).json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST poll live and emit updates
+router.post("/import/live/poll", async (req, res) => {
+  try {
+    const result = await pollLiveMatchesAndEmitUpdates();
+    res.status(result.success ? 200 : 400).json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
