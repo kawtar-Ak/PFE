@@ -1,299 +1,116 @@
 const express = require("express");
+const router = express.Router();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const rateLimit = require("express-rate-limit");
 const AuthenticatedUser = require("../User/UserModel");
+const { OAuth2Client } = require('google-auth-library');
 
-const router = express.Router();
+// Le Client ID doit provenir de tes variables d'environnement (ex: fichier .env)
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-const EMAIL_REGEX = /^(?!.*\s)(?!\.)(?!.*\.\.)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
-const USERNAME_REGEX = /^(?=.{3,20}$)[A-Za-z0-9._]+$/;
-const DISPOSABLE_DOMAINS = new Set([
-  "mailinator.com",
-  "10minutemail.com",
-  "guerrillamail.com",
-  "tempmail.com",
-  "yopmail.com",
-  "trashmail.com"
-]);
+const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    message: "Trop de tentatives. Reessayez dans quelques minutes.",
-    errors: {
-      global: "Limite de tentatives atteinte."
-    }
-  }
-});
+async function findUserByEmail(rawEmail) {
+  const normalizedEmail = normalizeEmail(rawEmail);
+  if (!normalizedEmail) return null;
 
-const normalizeEmail = (value = "") => value.trim().toLowerCase();
-const normalizeUsername = (value = "") => value.trim();
+  let user = await AuthenticatedUser.findOne({ email: normalizedEmail });
+  if (user) return user;
 
-const escapeRegex = (value = "") => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return AuthenticatedUser.findOne({
+    email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" },
+  });
+}
 
-const getPasswordAnalysis = (password = "") => {
-  const criteria = {
-    length: password.length >= 10,
-    lowercase: /[a-z]/.test(password),
-    uppercase: /[A-Z]/.test(password),
-    digit: /\d/.test(password),
-    special: /[!@#$%^&*()_+\-=\[\]{};':",.<>/?\\|~`]/.test(password)
-  };
-
-  const passedCount = Object.values(criteria).filter(Boolean).length;
-  let strength = "FAIBLE";
-
-  if (passedCount === 5) {
-    strength = "FORT";
-  } else if (passedCount >= 3) {
-    strength = "MOYEN";
-  }
-
-  const missing = [];
-
-  if (!criteria.length) missing.push("Au moins 10 caracteres");
-  if (!criteria.lowercase) missing.push("Au moins une lettre minuscule");
-  if (!criteria.uppercase) missing.push("Au moins une lettre majuscule");
-  if (!criteria.digit) missing.push("Au moins un chiffre");
-  if (!criteria.special) missing.push("Au moins un caractere special");
-
-  return {
-    strength,
-    passedCount,
-    missing,
-    criteria
-  };
-};
-
-const validateEmail = (email) => {
-  if (!email) {
-    return "Adresse email requise.";
-  }
-
-  if (/\s/.test(email)) {
-    return "L'adresse email ne doit pas contenir d'espaces.";
-  }
-
-  if (!EMAIL_REGEX.test(email)) {
-    return "Adresse email invalide.";
-  }
-
-  const domain = email.split("@")[1];
-  if (!domain || !domain.includes(".")) {
-    return "Adresse email invalide.";
-  }
-
-  if (DISPOSABLE_DOMAINS.has(domain)) {
-    return "Les adresses email temporaires ne sont pas autorisees.";
-  }
-
-  return null;
-};
-
-const validateUsername = (username) => {
-  if (!username) {
-    return "Nom d'utilisateur requis.";
-  }
-
-  if (/\s/.test(username)) {
-    return "Le nom d'utilisateur ne doit pas contenir d'espaces.";
-  }
-
-  if (!USERNAME_REGEX.test(username)) {
-    return "Utilisez 3 a 20 caracteres: lettres, chiffres, points ou underscores.";
-  }
-
-  return null;
-};
-
-const buildValidationResponse = ({ message, errors = {}, strength = null, missing = [] }) => ({
-  message,
-  errors,
-  strength,
-  missing
-});
-
-const buildGoogleUsername = async (name, email, userIdSeed = "") => {
-  const baseSource = (name || email.split("@")[0] || "user")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^A-Za-z0-9._]/g, "")
-    .replace(/^\.+|\.+$/g, "");
-
-  let candidate = (baseSource || "user").slice(0, 20);
-  if (candidate.length < 3) {
-    candidate = `${candidate}user`.slice(0, 20);
-  }
-
-  let suffix = 0;
-  let uniqueCandidate = candidate;
-
-  while (await AuthenticatedUser.findOne({ username: uniqueCandidate })) {
-    const seed = String(userIdSeed || Date.now()).replace(/\D/g, "");
-    const addon = seed.slice(-4) || String(suffix + 1);
-    const trimmedBase = candidate.slice(0, Math.max(3, 20 - addon.length - 1));
-    uniqueCandidate = `${trimmedBase}_${addon}`.slice(0, 20);
-    suffix += 1;
-  }
-
-  return uniqueCandidate;
-};
-
-const signUserToken = (user) => jwt.sign(
-  { id: user._id, email: user.email, username: user.username },
-  process.env.JWT_SECRET || "fallback_secret_123",
-  { expiresIn: "7d" }
-);
-
-router.post("/register", authLimiter, async (req, res) => {
+// POST /register
+router.post("/register", async (req, res) => {
   try {
-    const email = normalizeEmail(req.body?.email);
-    const username = normalizeUsername(req.body?.username);
-    const password = req.body?.password || "";
-
-    const emailError = validateEmail(email);
-    const usernameError = validateUsername(username);
-    const passwordAnalysis = getPasswordAnalysis(password);
-    const passwordError = passwordAnalysis.strength === "FAIBLE"
-      ? "Mot de passe trop faible."
-      : null;
-
-    const errors = {};
-    if (emailError) errors.email = emailError;
-    if (usernameError) errors.username = usernameError;
-    if (passwordError) errors.password = passwordError;
-
-    if (Object.keys(errors).length > 0) {
-      return res.status(400).json(buildValidationResponse({
-        message: "Veuillez corriger les champs invalides.",
-        errors,
-        strength: passwordAnalysis.strength,
-        missing: passwordAnalysis.missing
-      }));
+    console.log("Raw body received:", req.body);
+    const { password, username } = req.body;
+    const email = normalizeEmail(req.body.email);
+    
+    console.log("Register request received:", { email, username, password: password ? "****" : "MISSING" });
+    
+    if (!email || !password || !username) {
+      return res.status(400).json({ message: "Missing required fields" });
     }
 
-    const existingUser = await AuthenticatedUser.findOne({ email });
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: "Invalid email format" });
+    }
+
+    const existingUser = await findUserByEmail(email);
     if (existingUser) {
-      return res.status(409).json(buildValidationResponse({
-        message: "Cette adresse email est deja utilisee.",
-        errors: { email: "Cette adresse email est deja utilisee." },
-        strength: passwordAnalysis.strength,
-        missing: passwordAnalysis.missing
-      }));
-    }
-
-    const existingUsername = await AuthenticatedUser.findOne({
-      username: { $regex: `^${escapeRegex(username)}$`, $options: "i" }
-    });
-
-    if (existingUsername) {
-      return res.status(409).json(buildValidationResponse({
-        message: "Ce nom d'utilisateur est deja pris.",
-        errors: { username: "Ce nom d'utilisateur est deja pris." },
-        strength: passwordAnalysis.strength,
-        missing: passwordAnalysis.missing
-      }));
+      return res.status(400).json({ message: "Email already exists" });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const newUser = new AuthenticatedUser({
-      email,
-      passwordHash,
+    const newUser = new AuthenticatedUser({ 
+      email, 
+      passwordHash, 
       username,
-      isGoogleUser: false
+      isGoogleUser: false 
     });
-
     await newUser.save();
 
-    const token = signUserToken(newUser);
+    const token = jwt.sign(
+      { id: newUser._id, email: newUser.email },
+      process.env.JWT_SECRET || "fallback_secret_123",
+      { expiresIn: "7d" }
+    );
 
-    return res.status(201).json({
-      message: "Utilisateur cree avec succes.",
-      user: {
-        id: newUser._id,
-        email: newUser.email,
-        username: newUser.username
-      },
-      token,
-      strength: passwordAnalysis.strength,
-      missing: []
+    res.status(201).json({
+      message: "User registered successfully",
+      user: { id: newUser._id, email: newUser.email, username: newUser.username },
+      token
     });
   } catch (error) {
     console.error("Register error:", error);
-    return res.status(500).json(buildValidationResponse({
-      message: "Erreur serveur.",
-      errors: { global: error.message || "Erreur interne." }
-    }));
+    res.status(500).json({ message: "Server error", error: error.message });
   }
 });
 
-router.post("/login", authLimiter, async (req, res) => {
-  const normalizedEmail = normalizeEmail(req.body?.email);
-  const password = req.body?.password || "";
-
-  if (!normalizedEmail || !password) {
-    return res.status(400).json(buildValidationResponse({
-      message: "Email et mot de passe requis.",
-      errors: {
-        email: !normalizedEmail ? "Adresse email requise." : undefined,
-        password: !password ? "Mot de passe requis." : undefined
-      }
-    }));
-  }
-
-  if (validateEmail(normalizedEmail)) {
-    return res.status(400).json(buildValidationResponse({
-      message: "Adresse email invalide.",
-      errors: {
-        email: "Adresse email invalide."
-      }
-    }));
+// POST /login
+router.post("/login", async (req, res) => {
+  const { password } = req.body;
+  const email = normalizeEmail(req.body.email);
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email et mot de passe requis." });
   }
 
   try {
-    const user = await AuthenticatedUser.findOne({
-      email: { $regex: `^${escapeRegex(normalizedEmail)}$`, $options: "i" }
-    });
-
-    if (!user) {
-      return res.status(401).json(buildValidationResponse({
-        message: "Identifiants invalides.",
-        errors: {
-          credentials: "Email ou mot de passe incorrect."
-        }
-      }));
+    const user = await findUserByEmail(email);
+    if (!user) return res.status(401).json({ error: "Identifiants invalides." });
+    
+    // Protection optionnelle selon ton modèle
+    if (user.accountStatus && user.accountStatus !== "ACTIVE") {
+      return res.status(403).json({ error: "Ce compte est désactivé." });
     }
 
-    if (user.accountStatus !== "ACTIVE") {
-      return res.status(403).json(buildValidationResponse({
-        message: "Compte indisponible.",
-        errors: {
-          credentials: "Connexion impossible pour ce compte."
-        }
-      }));
+    if (user.isGoogleUser && !user.passwordHash) {
+      return res.status(400).json({ error: "Ce compte est lie a Google. Utilisez le bouton Se connecter avec Google." });
     }
 
-    const isMatch = await bcrypt.compare(password, user.passwordHash || "");
-    if (!isMatch) {
-      return res.status(401).json(buildValidationResponse({
-        message: "Identifiants invalides.",
-        errors: {
-          credentials: "Email ou mot de passe incorrect."
-        }
-      }));
+    if (!user.passwordHash) {
+      return res.status(401).json({ error: "Identifiants invalides." });
     }
+
+    const isMatch = await bcrypt.compare(password, user.passwordHash);
+    if (!isMatch) return res.status(401).json({ error: "Identifiants invalides." });
 
     user.lastLogin = new Date();
     await user.save({ validateBeforeSave: false });
 
-    const token = signUserToken(user);
+    const token = jwt.sign(
+      { id: user._id, email: user.email, username: user.username },
+      process.env.JWT_SECRET || "fallback_secret_123",
+      { expiresIn: "7d" }
+    );
 
-    return res.status(200).json({
-      message: "Connexion reussie.",
+    res.status(200).json({
+      message: "Connexion réussie.",
       token,
       user: {
         id: user._id,
@@ -303,72 +120,63 @@ router.post("/login", authLimiter, async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Erreur login:", err);
-    return res.status(500).json(buildValidationResponse({
-      message: "Erreur serveur.",
-      errors: {
-        global: "Erreur interne."
-      }
-    }));
+    console.error("Erreur login :", err);
+    res.status(500).json({ error: "Erreur serveur." });
   }
 });
 
 router.post("/google-login", async (req, res) => {
-  const email = normalizeEmail(req.body?.email);
-  const name = normalizeUsername(req.body?.name);
-  const googleId = req.body?.googleId;
-  const photoUrl = req.body?.photoUrl || null;
-
-  const emailError = validateEmail(email);
-
-  if (!email || !name || !googleId || emailError) {
-    return res.status(400).json(buildValidationResponse({
-      message: "Donnees Google incompletes.",
-      errors: {
-        email: emailError || (!email ? "Adresse email requise." : undefined),
-        username: !name ? "Nom requis." : undefined,
-        global: !googleId ? "Identifiant Google manquant." : undefined
-      }
-    }));
+  const { idToken } = req.body;
+  if (!idToken) {
+    return res.status(400).json({ error: "idToken requis." });
   }
 
   try {
-    let user = await AuthenticatedUser.findOne({ email });
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const email = normalizeEmail(payload?.email);
+    const googleId = payload?.sub;
+    const name = payload?.name || payload?.given_name || "Utilisateur Google";
+    const photoUrl = payload?.picture || null;
+
+    if (!email || !googleId) {
+      return res.status(401).json({ error: "Token Google invalide." });
+    }
+
+    let user = await findUserByEmail(email);
 
     if (!user) {
-      const generatedUsername = await buildGoogleUsername(name, email, googleId);
-      const randomPassword = Math.random().toString(36).slice(-12);
+      const randomPassword = Math.random().toString(36).slice(-10);
       const passwordHash = await bcrypt.hash(randomPassword, 10);
 
       user = new AuthenticatedUser({
         email,
-        username: generatedUsername,
+        username: name,
         passwordHash,
         isGoogleUser: true,
         picture: photoUrl
       });
-
       await user.save();
     } else {
-      if (user.accountStatus !== "ACTIVE") {
-        return res.status(403).json(buildValidationResponse({
-          message: "Compte indisponible.",
-          errors: {
-            credentials: "Connexion impossible pour ce compte."
-          }
-        }));
-      }
-
       user.isGoogleUser = true;
       user.picture = photoUrl || user.picture;
+      user.username = name || user.username;
       user.lastLogin = new Date();
       await user.save({ validateBeforeSave: false });
     }
 
-    const token = signUserToken(user);
+    const token = jwt.sign(
+      { id: user._id, email: user.email, username: user.username },
+      process.env.JWT_SECRET || "fallback_secret_123",
+      { expiresIn: "7d" }
+    );
 
-    return res.status(200).json({
-      message: "Connexion via Google reussie.",
+    res.status(200).json({
+      message: "Connexion via Google réussie.",
       token,
       user: {
         id: user._id,
@@ -379,14 +187,10 @@ router.post("/google-login", async (req, res) => {
         accountStatus: user.accountStatus || "ACTIVE"
       }
     });
+
   } catch (error) {
-    console.error("Google login error:", error);
-    return res.status(500).json(buildValidationResponse({
-      message: "Erreur serveur lors de l'authentification Google.",
-      errors: {
-        global: "Erreur interne."
-      }
-    }));
+    console.error("Erreur lors de l'authentification Google:", error);
+    res.status(500).json({ error: "Erreur serveur lors de l'authentification Google." });
   }
 });
 

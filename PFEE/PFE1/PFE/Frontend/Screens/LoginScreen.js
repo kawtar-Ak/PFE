@@ -23,14 +23,25 @@ export default function LoginScreen({ navigation, route }) {
 
   const redirectTo = route?.params?.redirectTo || 'Home';
   const message = route?.params?.message || '';
+  const prefillEmail = route?.params?.prefillEmail || '';
+
+  useEffect(() => {
+    if (prefillEmail) {
+      setEmail(prefillEmail);
+      setPassword('');
+    }
+  }, [prefillEmail]);
 
   // 1. Configuration de la requête Google
   const [request, response, promptAsync] = useAuthRequest(
     {
       clientId: '708632300002-37shi475804djm76v9fr6g7c27ee8pe9.apps.googleusercontent.com',
-      responseType: 'token',
+      responseType: 'id_token',
       scopes: ['openid', 'profile', 'email'],
       redirectUri: makeRedirectUri({}),
+      extraParams: {
+        nonce: 'pfe_google_nonce',
+      },
       usePKCE: false,
     },
     { authorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth' }
@@ -39,10 +50,10 @@ export default function LoginScreen({ navigation, route }) {
   // 2. Écouter la réponse de la fenêtre Google
   useEffect(() => {
     if (response?.type === 'success') {
-      const { access_token } = response.params;
-      console.log("🎯 ACCESS TOKEN GOOGLE RECU:", access_token);
+      const { id_token } = response.params;
+      console.log("🎯 ID TOKEN GOOGLE RECU:", !!id_token);
       console.log("📦 Réponse complète Google:", response);
-      handleGoogleLoginWithBackend(access_token);
+      handleGoogleLoginWithBackend(id_token);
     } else if (response?.type === 'error' || response?.type === 'dismiss') {
       // Si l'utilisateur ferme la fenêtre ou s'il y a une erreur
       console.log("❌ Google Auth annulé ou erreur:", response);
@@ -51,37 +62,50 @@ export default function LoginScreen({ navigation, route }) {
   }, [response]);
 
   const handleRedirectAfterLogin = () => {
-    if (redirectTo === 'Favoris') {
-      navigation.replace('Home', { screen: 'Favoris' });
-      return;
-    }
-    if (redirectTo === 'Profile') {
-      navigation.replace('Profile');
-      return;
-    }
-    navigation.replace('Home', { screen: 'Home' });
+    navigation.replace('Profile');
   };
 
   const handleLogin = async () => {
-    const normalizedEmail = email.trim().toLowerCase();
+    let normalizedEmail = email.trim();
+    let normalizedPassword = password;
 
-    if (!normalizedEmail || !password) {
+    // Sur web, l'autofill navigateur peut remplir visuellement sans mettre a jour l'etat React.
+    if (Platform.OS === 'web' && typeof document !== 'undefined') {
+      const emailInput =
+        document.getElementById('login-email') ||
+        document.querySelector('input[type="email"]') ||
+        document.querySelector('input[placeholder="Email"]');
+      const passwordInput =
+        document.getElementById('login-password') ||
+        document.querySelector('input[type="password"]') ||
+        document.querySelector('input[placeholder="Mot de passe"]');
+
+      const emailFromDom = String(emailInput?.value || '').trim();
+      const passwordFromDom = String(passwordInput?.value || '');
+
+      if (emailFromDom) {
+        normalizedEmail = emailFromDom;
+        setEmail(emailFromDom);
+      }
+      if (passwordFromDom) {
+        normalizedPassword = passwordFromDom;
+        setPassword(passwordFromDom);
+      }
+    }
+
+    if (!normalizedEmail || !normalizedPassword) {
       Alert.alert('Erreur', 'Veuillez remplir tous les champs.');
       return;
     }
-
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(normalizedEmail)) {
-      Alert.alert('Erreur', 'Veuillez saisir une adresse email valide.');
-      return;
-    }
-
     setLoading(true);
     try {
       const response = await fetch(`${API_URL}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: normalizedEmail, password }),
+        body: JSON.stringify({
+          email: normalizedEmail,
+          password: normalizedPassword,
+        }),
       });
       const data = await response.json();
       if (!response.ok) {
@@ -98,41 +122,17 @@ export default function LoginScreen({ navigation, route }) {
     }
   };
 
-  // 3. NOUVELLE VERSION: Récupérer les infos Google et les envoyer au backend
-  const handleGoogleLoginWithBackend = async (accessToken) => {
+  // 3. Envoyer idToken Google au backend pour vérification
+  const handleGoogleLoginWithBackend = async (idToken) => {
     try {
-      if (!accessToken) {
-        throw new Error('Token Google manquant');
+      if (!idToken) {
+        throw new Error('ID token Google manquant');
       }
 
-      console.log("🔄 Étape 1: Récupération des infos utilisateur depuis Google...");
-      
-      // Étape 1: Récupérer les infos utilisateur depuis Google
-      const userInfoResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { 'Authorization': `Bearer ${accessToken}` }
-      });
-      
-      if (!userInfoResponse.ok) {
-        throw new Error('Impossible de récupérer les infos Google');
-      }
-      
-      const userInfo = await userInfoResponse.json();
-      console.log("✅ Étape 2: Infos Google reçues:", userInfo);
-      
-      // Étape 2: Préparer les données pour le backend
-      const dataToSend = {
-        email: userInfo.email,
-        name: userInfo.name || userInfo.given_name || 'Utilisateur Google',
-        googleId: userInfo.sub,
-        photoUrl: userInfo.picture
-      };
-      console.log("📤 Étape 3: Envoi au backend:", dataToSend);
-      
-      // Étape 3: Envoyer au backend
       const response = await fetch(`${API_URL}/google-login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(dataToSend),
+        body: JSON.stringify({ idToken }),
       });
       
       const data = await response.json();
@@ -165,6 +165,22 @@ export default function LoginScreen({ navigation, route }) {
     return 'Connectez-vous pour synchroniser vos favoris et votre profil.';
   }, [message]);
 
+  const startGoogleAuth = async (provider) => {
+    if (!request) {
+      Alert.alert('Patientez', 'Initialisation de la connexion...');
+      return;
+    }
+
+    try {
+      setGoogleLoading(true);
+      await promptAsync({ extraParams: { prompt: 'select_account' } });
+    } catch (error) {
+      console.error(`Erreur ouverture ${provider}:`, error);
+      Alert.alert('Erreur', `Impossible d ouvrir la connexion ${provider}.`);
+      setGoogleLoading(false);
+    }
+  };
+
   return (
     <ImageBackground
       source={require('../img/result_0.jpeg')}
@@ -192,13 +208,14 @@ export default function LoginScreen({ navigation, route }) {
 
               <TextInput 
                 style={styles.input} 
-                placeholder="Adresse email" 
+                placeholder="Email" 
                 placeholderTextColor="#7F8AA3" 
                 value={email} 
                 onChangeText={setEmail} 
                 autoCapitalize="none" 
                 keyboardType="email-address" 
-                autoCorrect={false}
+                autoComplete="off"
+                nativeID="login-email"
               />
               
               <TextInput 
@@ -208,12 +225,13 @@ export default function LoginScreen({ navigation, route }) {
                 value={password} 
                 onChangeText={setPassword} 
                 secureTextEntry 
+                autoComplete="off"
+                nativeID="login-password"
               />
-
               <TouchableOpacity 
                 style={[styles.primaryButton, loading && styles.buttonDisabled]} 
                 onPress={handleLogin} 
-                disabled={loading || googleLoading} 
+                disabled={loading || googleLoading}
                 activeOpacity={0.9}
               >
                 {loading ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.primaryButtonText}>Se connecter</Text>}
@@ -232,18 +250,17 @@ export default function LoginScreen({ navigation, route }) {
                   <Text style={styles.googleButtonLoadingText}>Connexion en cours...</Text>
                 </View>
               ) : (
+                <>
                 <TouchableOpacity
-                  style={[styles.googleButton, (!request || loading) && styles.buttonDisabled]}
-                  onPress={() => {
-                    console.log("🟢 Clic sur bouton Google, ouverture de la fenêtre...");
-                    setGoogleLoading(true);
-                    promptAsync(); // Ouvre la fenêtre Web Google
-                  }}
-                  disabled={!request || loading}
+                  style={[styles.googleButton, loading && styles.buttonDisabled]}
+                  onPress={() => startGoogleAuth('Google')}
+                  disabled={loading}
                   activeOpacity={0.9}
                 >
                   <Text style={styles.googleButtonText}>Se connecter avec Google</Text>
                 </TouchableOpacity>
+
+                </>
               )}
 
               <TouchableOpacity 
@@ -299,3 +316,5 @@ const styles = StyleSheet.create({
   },
   googleButtonLoadingText: { color: '#050B16', fontSize: 14, fontWeight: '600' }
 });
+
+
