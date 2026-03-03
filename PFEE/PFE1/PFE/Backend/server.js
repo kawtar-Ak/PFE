@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 const userRoutes = require("./User/UserRoute.js");
 const matchRoutes = require("./Match/MatchRoute.js");
 const { importAllMatches } = require("./Match/importService.js");
@@ -19,6 +20,20 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
+
+app.set("trust proxy", 1);
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: "Trop de requetes. Reessayez dans quelques minutes."
+  }
+});
+
+app.use(globalLimiter);
 
 // MongoDB Connection
 mongoose

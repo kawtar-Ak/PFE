@@ -63,16 +63,25 @@ export default function LoginScreen({ navigation, route }) {
   };
 
   const handleLogin = async () => {
-    if (!email || !password) {
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!normalizedEmail || !password) {
       Alert.alert('Erreur', 'Veuillez remplir tous les champs.');
       return;
     }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(normalizedEmail)) {
+      Alert.alert('Erreur', 'Veuillez saisir une adresse email valide.');
+      return;
+    }
+
     setLoading(true);
     try {
       const response = await fetch(`${API_URL}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email: normalizedEmail, password }),
       });
       const data = await response.json();
       if (!response.ok) {
@@ -183,12 +192,13 @@ export default function LoginScreen({ navigation, route }) {
 
               <TextInput 
                 style={styles.input} 
-                placeholder="Email" 
+                placeholder="Adresse email" 
                 placeholderTextColor="#7F8AA3" 
                 value={email} 
                 onChangeText={setEmail} 
                 autoCapitalize="none" 
                 keyboardType="email-address" 
+                autoCorrect={false}
               />
               
               <TextInput 
